@@ -1,0 +1,453 @@
+---
+title: >
+  Analysis for "Time Thresholds for using Pressure Reactivity Index in Neuroprognostication for Patients with Severe Traumatic Brain Injury"
+format:
+  html:
+    embed-resources: true
+---
+
+```{r}
+#| label: setup
+#| echo: false
+#| include: false
+knitr::opts_chunk$set(warning = FALSE,
+                      error = FALSE,
+                      message = FALSE,
+                      echo = FALSE,
+                      fig.align = 'center',
+                      out.width = '100%',
+                      fig.width = 6.5,
+                      fig.height = 4)
+
+N_CPUS <- 3
+```
+
+```{r}
+#| label: load-packages
+library(tidyverse)
+library(readxl)
+library(scales)
+library(lubridate)
+library(magrittr)
+```
+
+```{r}
+#| label: load-utility-code
+source("read_data.R") # this will create the objects `parsed_data` and `vital_status`.
+source("plotting.R")
+source("wavelet_filtering.R")
+source("feature_engineering.R")
+source("modelling_utils.R")
+```
+
+```{r}
+#| label: wavelet-filtering
+global_wv_smooth <- wavelet_movingavg(parsed_data, target_res = 11L)
+```
+
+# Main text
+
+## Data visualizations
+
+```{r}
+#| label: patient-data-availability
+#| fig-height: 3.5
+#| out-width: 100%
+#| fig-cap: >
+#|   Figure 1: Time-span and number of days of pressure reactivity index monitoring in 
+#|   each patient with severe traumatic brain injury. Gray shaded areas represent time
+#|    periods where pressure reactivity index monitoring data was missing. 
+rle_ranges <- function (x, minutes) {
+  enc <- rle(x)
+  ends <- cumsum(enc$lengths)
+  starts <- c(1L, ends[-length(ends)] + 1L)
+  
+  tibble(from = minutes[starts[enc$values]],
+         to = minutes[ends[enc$values]],
+         what = 'segment') %>% 
+    rbind(tibble(from = min(minutes),
+                 to = max(minutes),
+                 what = 'range'))
+}
+
+coverage_data <- parsed_data %>% 
+  group_by(pat_id, pat_nr) %>% 
+  group_modify(~ rle_ranges(is.na(.x$prx), .x$minute)) %>% 
+  ungroup() %>%
+  left_join(vital_status) %>% 
+  mutate(to = pmax(to, from + 20) / (24 * 60),
+         from = from / (24 * 60),
+         yfct = fct_inseq(as.character(pat_nr)),
+         y = -as.integer(yfct))
+
+coverage_data %>% 
+  filter(what == 'range') %>% 
+  ggplot(aes(y = y, xmin = from, xmax = to)) +
+  geom_linerange(aes(color = vital_status, linetype = vital_status), linewidth = 1) +
+  geom_rect(data = filter(coverage_data, what == 'segment'),
+            mapping = aes(ymin = y - 0.4, ymax = y + 0.4),
+            fill = '#000000',
+            alpha = .7,
+            color = NA) +
+  vital_scale_col +
+  vital_scale_lty +
+  scale_y_continuous(breaks = unique(coverage_data$y),
+                     labels = function (x) {
+                       levels(coverage_data$yfct)
+                     }) +
+  scale_x_continuous(breaks = seq(0, 18, by = 2)) +
+  coord_cartesian(expand = 0, xlim = c(0, 19)) +
+  plottheme() +
+  labs(x = "Time (days)", y = "Patient ID")
+```
+
+```{r}
+#| label: prx-smoothed-extended
+#| out-width: 100%
+#| fig-height: 3.7
+#| fig-cap: |
+#|   Figure 2: Smoothed average pressure reactivity index trajectories per day in
+#|   good outcome and poor outcome patients with severe traumatic brain injury. 
+#|   Individual patients’ PRx trajectories were extended beyond the monitored 
+#|   time by the average PRx over the last 24-hour period. Gray shades depict 
+#|   approximate standard error bands of the average curve estimates.  
+requireNamespace("mgcv", quietly = TRUE)
+# Use a knot every 12 hours
+knots <- seq(min(parsed_data$minute),
+             max(parsed_data$minute),
+             by = 12 * 60)
+
+full_minute_grid <- tibble(minute = seq(min(parsed_data$minute),
+                                        max(parsed_data$minute),
+                                        by = 1))
+
+data_pat_extended <- parsed_data %>% 
+  group_by(pat_id, pat_nr) %>% 
+  group_modify(function (pat_data, pat_meta) {
+    pat_data %<>%
+      full_join(full_minute_grid, by = 'minute') %>% 
+      arrange(minute)
+    
+    avail <- which(!is.na(pat_data$prx_trans))
+    last_avail <- avail[[length(avail)]]
+    last_24h_prx_trans <- pat_data %>% 
+      filter(minute > minute[[last_avail]] - 60 * 24,
+             minute <= minute[[last_avail]]) %>% 
+      summarise(avg_prx = mean(prx_trans, na.rm = TRUE)) %>% 
+      `[[`('avg_prx')
+    
+    pat_data %>%
+      mutate(prx_trans = if_else(minute > minute[[last_avail]],
+                                 last_24h_prx_trans,
+                                 prx_trans))
+  }) %>% 
+  ungroup()
+
+data_pat_extended %>% 
+  left_join(vital_status) %>% 
+  bind_rows(mutate(data_pat_extended, vital_status = 'combined')) %>% 
+  group_by(vital_status) %>%
+  group_modify(function (x, y) {
+    fit <- mgcv::gam(prx_trans ~ s(minute, bs = "cs",
+                                   k = length(knots)), data = x,
+                     knots = list(knots))
+    pred_dat <- tibble(minute = seq(min(x$minute), max(x$minute),
+                                    by = 15),
+                       prx_trans = NA_real_,
+                       prx_trans_min = NA_real_,
+                       prx_trans_max = NA_real_)
+    pred <- predict(fit, newdata = pred_dat, se.fit = TRUE)
+    pred_dat$prx_trans <- as.vector(pred$fit)
+    pred_dat$prx_trans_min <- as.vector(with(pred, fit - 2 * se.fit))
+    pred_dat$prx_trans_max <- as.vector(with(pred, fit + 2 * se.fit))
+    pred_dat
+  }) %>% 
+  mutate(across(starts_with('prx'), list(orig = tanh))) %>% 
+  mutate(day = minute / (24 * 60)) %>% 
+  ggplot(aes(x = day,
+             y = prx_trans_orig,
+             ymin = prx_trans_min_orig,
+             ymax = prx_trans_max_orig,
+             group = vital_status,
+             linetype = vital_status,
+             color = vital_status)) +
+  geom_ribbon(color = NA, fill = 'gray30', alpha = 0.4) +
+  geom_line(linewidth = 1) +
+  scale_x_continuous(breaks = seq(0, 20, by = 2)) +
+  vital_scale_col +
+  vital_scale_lty +
+  plottheme() +
+  labs(x = "Time (days)", y = "Smoothed PRx")
+```
+
+```{r}
+#| label: prx-smoothed
+#| out-width: 100%
+#| fig-height: 3.7
+#| fig-cap: |
+#|   Figure 2: Smoothed average pressure reactivity index trajectories per day in
+#|   good outcome and poor outcome patients with severe traumatic brain injury. 
+#|   Gray shades depict approximate standard error bands of the average curve estimates.  
+parsed_data %>% 
+  left_join(vital_status) %>% 
+  bind_rows(mutate(parsed_data, vital_status = 'combined')) %>% 
+  group_by(vital_status) %>%
+  group_modify(function (x, y) {
+    fit <- mgcv::gam(prx_trans ~ s(minute, bs = "cs",
+                                   k = length(knots)), data = x,
+                     knots = list(knots))
+    pred_dat <- tibble(minute = seq(min(x$minute), max(x$minute),
+                                    by = 15),
+                       prx_trans = NA_real_,
+                       prx_trans_min = NA_real_,
+                       prx_trans_max = NA_real_)
+    pred <- predict(fit, newdata = pred_dat, se.fit = TRUE)
+    pred_dat$prx_trans <- as.vector(pred$fit)
+    pred_dat$prx_trans_min <- as.vector(with(pred, fit - 2 * se.fit))
+    pred_dat$prx_trans_max <- as.vector(with(pred, fit + 2 * se.fit))
+    pred_dat
+  }) %>% 
+  mutate(across(starts_with('prx'), list(orig = tanh))) %>% 
+  mutate(day = minute / (24 * 60)) %>% 
+  ggplot(aes(x = day,
+             y = prx_trans_orig,
+             ymin = prx_trans_min_orig,
+             ymax = prx_trans_max_orig,
+             group = vital_status,
+             linetype = vital_status,
+             color = vital_status)) +
+  geom_ribbon(color = NA, fill = 'gray30', alpha = 0.4) +
+  geom_line(linewidth = 1) +
+  scale_x_continuous(breaks = seq(0, 20, by = 2)) +
+  vital_scale_col +
+  vital_scale_lty +
+  plottheme() +
+  labs(x = "Time (days)", y = "Smoothed PRx")
+```
+
+## Predictive modeling
+
+```{r}
+#| label: prepare-history-stats
+#| cache: true
+prx_traj_history <- filter(global_wv_smooth, smoothing == 'wavelet') %>% 
+  group_by(pat_id) %>% 
+  filter(minute <= max(minute[!is.na(prx_trans)])) %>% 
+  ungroup() %>% 
+  left_join(vital_status, by = 'pat_id') %>% 
+  prep_traj_history()
+
+spline_stats_raw_12hrs <- seq(5, 17) %>% 
+  map_dfr(function (day) {
+    filter(global_wv_smooth, smoothing == 'none') %>% 
+      inner_join(vital_status, by = 'pat_id') %>% 
+      history_stats_splines(for_day = day, resolution = 12 * 60) %>% 
+      mutate(day = day)
+  })
+```
+
+```{r}
+#| label: sensitivity-over-time-glmnet-spraw12-fsm
+#| cache: true
+fits_elnet_spraw12_fsm <- lapply(2:17, function (for_day) {
+  mm <- spline_stats_raw_12hrs %>% 
+    filter(day == for_day | (for_day > max(day) & day == max(day))) %>% 
+    full_join(history_stats(prx_traj_history, for_day = for_day,
+                            vital_status = select(vital_status, pat_id, vital_status)), 
+              by = c('vital_status', 'pat_id')) %>% 
+    history_model_matrix()
+  
+  set.seed(123)
+  res <- elnet_cv(mm$x, mm$y, alpha = 0.8, nfolds = 5, cv_repl = 500,
+                  ncores = N_CPUS)
+  res$for_day <- for_day
+  res
+})
+
+specs <- 1 - (1:4) / sum(vital_status$vital_status == 'good', na.rm = TRUE)
+ts_all_spraw12_fsm <- thresh_vs_spec_all(fits_elnet_spraw12_fsm, specificities = specs,
+                                         ncores = N_CPUS)
+
+```
+
+```{r}
+#| label: sensitivity-over-time-glmnet-spraw12-fsm-plot
+#| fig-cap: |
+#|   Figure 3: Targeted specificities of >77.8%, >83.3%, >88.9%, >94.4% and corresponding
+#|   sensitivities for predicting poor outcome for each passing day in patients with severe
+#|   traumatic brain injury. The graph shows the mean sensitivity ± one standard deviation 
+#|   estimated from 500 replications of 5-fold cross-validation. When using a restriction of 
+#|   >83.3% specificity, sensitivity reached a peak value of 85% (±6 percentage points) at day 6.
+pm <- plot_multicut(ts_all_spraw12_fsm)
+pm$plot
+```
+
+```{r}
+pm$table %>% 
+  filter(day == 6)
+```
+
+
+```{r}
+#| label: sensitivity-over-time-glmnet-spraw12-fsm-roc
+#| fig-cap: |
+#|   Figure 4: Area under Curve- Receiver Operating Characteristic (AUC-ROC) curve 
+#|   values over time as achieved with linear logistic regression models using the 
+#|   features engineered from the 12-hour smoothed splines (based on raw PRx values) 
+#|   and wavelet-filtered PRx values. The graph depicts the mean AUC-ROC values ± one 
+#|   standard deviation estimated from 500 replications of 5-fold cross-validation.
+#|   AUC-ROC achieved a peak value of 0.93 (±0.02) at day 6 and consistent AUC-ROC
+#|   values >0.6 after day 9. 
+library(pROC)
+auc_time <- map_dfr(fits_elnet_spraw12_fsm, function (fit) {
+  sel <- pm$table %>% 
+    filter(day == fit$for_day) %>% 
+    slice(2)
+  
+  fit$sens_spec <- sens_spec(fit, sel$threshold)
+  fit <- select_best(fit, spec = sel$spec, se = FALSE)
+  lambda_ind <- which.min(abs(fit$lambda - fit$lambda_spec))
+
+  auc <- fit$cv_stat %>%
+    map_dbl(function(cvr) {
+      r <- roc(response = fit$y_01, predictor = cvr[ , lambda_ind],
+               algorithm = 3, direction = '<', auc = TRUE,
+               quiet = TRUE)
+
+      r$auc[[1]]
+    })
+  
+  tibble(auc_avg = mean(auc),
+         auc_lw = auc_avg - sd(auc),
+         auc_up = auc_avg + sd(auc),
+         day = fit$for_day)
+})
+
+auc_time %>% 
+  ggplot(aes(x = day, y = auc_avg,
+             ymin = auc_lw,
+             ymax = auc_up)) +
+  geom_linerange(alpha = 0.7) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  scale_y_continuous(limits = c(0.32, 1.01),
+                     breaks = seq(0.2, 1, by = 0.1)) +
+  scale_x_continuous(breaks = seq(5, 17, by = 2),
+                     labels = seq(5, 17, by = 2)) +
+  plottheme() +
+  labs(x = "Time (days)",
+       y = "AUC")
+```
+
+# Supplementary Material
+
+### eFigure 1
+
+```{r}
+#| label: penalized-logistic-days-6-plot
+#| include: false
+#| fig-width: 6
+#| fig-height: 4
+#| fig-cap: |
+#|   Prediction performance of models built on the engineered features using
+#|   data of the first 6 days.
+#|   Sensitivity is the proporition of patients with poor outcomes correctly
+#|   predicted, while specificity is the proportion of patients with good
+#|   outcome correctly predicted.
+for_day <- 6
+mm <- spline_stats_raw_12hrs %>% 
+  filter(day == for_day | (for_day > max(day) & day == max(day))) %>% 
+  full_join(history_stats(prx_traj_history, for_day = for_day, 
+                          vital_status = select(vital_status, pat_id, vital_status)),
+            by = c('vital_status', 'pat_id')) %>% 
+  history_model_matrix()
+
+set.seed(123)
+cv_fit <- elnet_cv(mm$x, mm$y, alpha = 0.8, nfolds = 5, cv_repl = 500,
+                   ncores = N_CPUS)
+
+cv_fit$sens_spec <- sens_spec(cv_fit, 0.5)
+cv_fit <- select_best(cv_fit, spec = 1 - 3 / sum(mm$y == 'good'), se = FALSE)
+
+
+plot_sensspec(cv_fit)
+```
+
+### eFigure 2
+
+```{r}
+#| label: penalized-logistic-days-11-plot
+#| fig-width: 6
+#| fig-height: 4
+#| fig-cap: |
+#|   Prediction performance of models built on the engineered features using
+#|   data of the first 11 days.
+#|   Sensitivity is the proporition of patients with poor outcomes correctly
+#|   predicted, while specificity is the proportion of patients with good
+#|   outcome correctly predicted.
+#| include: false
+for_day <- 11
+mm <- spline_stats_raw_12hrs %>% 
+  filter(day == for_day | (for_day > max(day) & day == max(day))) %>% 
+  full_join(history_stats(prx_traj_history, for_day = for_day, 
+                          vital_status = select(vital_status, pat_id, vital_status)),
+            by = c('vital_status', 'pat_id')) %>% 
+  history_model_matrix()
+
+set.seed(123)
+cv_fit <- elnet_cv(mm$x, mm$y, alpha = 0.8, nfolds = 5, cv_repl = 500,
+                   ncores = N_CPUS)
+
+cv_fit$sens_spec <- sens_spec(cv_fit, 0.5)
+cv_fit <- select_best(cv_fit, spec = 1 - 3 / sum(mm$y == 'good'), se = FALSE)
+
+plot_sensspec(cv_fit)
+```
+
+
+### eFigure 3
+
+```{r}
+#| label: individual-patient-splines
+#| out-width: 100%
+#| fig-height: 3.7
+#| fig-cap: |
+#|   Figure Supp XY: Smoothed PRx trajectories for all patients in the study.
+pat_data_splines <- data_pat_extended %>% 
+  group_by(pat_id) %>% 
+  group_modify(function (x, y) {
+    fit <- mgcv::gam(prx_trans ~ s(minute, bs = "cs",
+                                   k = length(knots)), data = x,
+                     knots = list(knots))
+    
+    extended_time_range <- x$minute[range(which(!is.na(x$prx_trans)))]
+    original_time_range <- x$minute[range(which(!is.na(x$prx)))]
+    
+    pred_dat <- tibble(minute = seq(min(x$minute), max(x$minute),
+                                    by = 15),
+                       prx_trans = NA_real_,
+                       prx_trans_min = NA_real_,
+                       prx_trans_max = NA_real_) %>% 
+      filter(minute >= extended_time_range[[1]],
+             minute <= extended_time_range[[2]]) %>% 
+      mutate(is_extended = minute < original_time_range[[1]] |
+               minute > original_time_range[[2]])
+    pred <- predict(fit, newdata = pred_dat, se.fit = TRUE)
+    pred_dat$prx_trans <- as.vector(pred$fit)
+    pred_dat$prx_trans_min <- as.vector(with(pred, fit - 2 * se.fit))
+    pred_dat$prx_trans_max <- as.vector(with(pred, fit + 2 * se.fit))
+    pred_dat
+  }) %>% 
+  mutate(across(starts_with('prx'), list(orig = tanh)),
+         day = minute / (24 * 60))
+
+pat_data_splines %>% 
+  filter(!is_extended) %>% 
+  ggplot(aes(x = day, y = prx_trans_orig, group = pat_id, color = pat_id)) +
+  geom_line(linewidth = 0.8) +
+  scale_color_manual(values = rep(unname(COLORPAL),
+                                  length.out = length(unique(data_pat_extended$pat_id))),
+                     guide = "none") +
+  plottheme() +
+  labs(x = "Time (days)", y = "Smoothed PRx")
+```
